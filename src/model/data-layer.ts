@@ -243,6 +243,74 @@ export class DataLayer<HorzScaleItem> {
 		return this.setSeriesData(series, []);
 	}
 
+	/** Read-only view of the sorted time-scale points. Used by the streaming raw
+	 * path to hand the point array to model.updateTimeScale without exposing
+	 * the mutable backing store. */
+	public get sortedTimePoints(): readonly InternalTimeScalePoint[] {
+		return this._sortedTimePoints;
+	}
+
+	/**
+	 * Streaming-append fast path for single-value series (Line / Area / Histogram /
+	 * Baseline). Bypasses preprocess, time-conversion, originalTime tracking,
+	 * full validation, DataUpdateResponse construction, and the O(N) PlotList
+	 * _indices rebuild. Caller MUST guarantee that `time` is a strictly-monotonic
+	 * InternalHorzScaleItem (numeric UTCTimestamp for time-series charts), and
+	 * that the series is one of the four single-value types listed above.
+	 *
+	 * Returns the constructed plot row plus a flag indicating whether the time
+	 * scale gained a new point (for the caller to decide whether to invoke
+	 * model.updateTimeScale).
+	 */
+	public updateLineSeriesRaw<TSeriesType extends 'Line' | 'Area' | 'Histogram' | 'Baseline'>(
+		series: Series<TSeriesType>,
+		time: InternalHorzScaleItem,
+		value: number
+	): { plotRow: SeriesPlotRow<TSeriesType>; affectsTimeScale: boolean; firstChangedPointIndex: TimePointIndex } {
+		const horzItemKey = this._horzScaleBehavior.key(time);
+		let pointData = this._pointDataByTimePoint.get(horzItemKey);
+		const affectsTimeScale = pointData === undefined;
+
+		if (pointData === undefined) {
+			pointData = createEmptyTimePointData(time);
+			this._pointDataByTimePoint.set(horzItemKey, pointData);
+		}
+
+		let firstChangedPointIndex = -1 as TimePointIndex;
+		if (affectsTimeScale) {
+			const insertIndex = this._sortedTimePoints.length;
+			const newPoint: InternalTimeScalePoint = {
+				timeWeight: 0 as TickMarkWeightValue,
+				time: pointData.timePoint,
+				pointData,
+				// We don't have the original (pre-preprocess) time here. Use the
+				// internal time as originalTime — for time-series charts this is
+				// the numeric UTCTimestamp, which is what the public API accepts.
+				originalTime: time as unknown as HorzScaleItem,
+			};
+			(this._sortedTimePoints as InternalTimeScalePoint[]).push(newPoint);
+			assignIndexToPointData(pointData, insertIndex as TimePointIndex);
+			this._horzScaleBehavior.fillWeightsForPoints(this._sortedTimePoints, insertIndex);
+			firstChangedPointIndex = insertIndex as TimePointIndex;
+		}
+
+		// Inline minimal plot row. Line / Area / Histogram / Baseline all share the
+		// [v, v, v, v] value layout. Avoiding getSeriesPlotRowCreator's dispatch and
+		// the originalTime/customSeriesPlotValuesBuilder closures saves several
+		// per-call allocations.
+		const plotRow = {
+			index: pointData.index,
+			time,
+			value: [value, value, value, value],
+			originalTime: time,
+		} as unknown as Mutable<SeriesPlotRow<TSeriesType>>;
+
+		pointData.mapping.set(series as Series<SeriesType>, plotRow as SeriesPlotRow<SeriesType>);
+		this._seriesLastTimePoint.set(series as Series<SeriesType>, time);
+
+		return { plotRow: plotRow as SeriesPlotRow<TSeriesType>, affectsTimeScale, firstChangedPointIndex };
+	}
+
 	// eslint-disable-next-line complexity
 	public updateSeriesData<TSeriesType extends SeriesType>(series: Series<TSeriesType>, data: SeriesDataItemTypeMap<HorzScaleItem>[TSeriesType], historicalUpdate: boolean): DataUpdateResponse {
 		// check if conflation is enabled and this is a historical update

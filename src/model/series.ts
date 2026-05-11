@@ -296,6 +296,23 @@ export class Series<T extends SeriesType> extends PriceDataSource implements IDe
 		this.model().lightUpdate();
 	}
 
+	/**
+	 * Streaming-append fast path. Pushes a single plot row through PlotList.appendOne
+	 * (in-place, no O(N) rebuild) and refreshes the pane view, but deliberately
+	 * skips model.recalculatePane (the cross-visible-range autoscale recompute)
+	 * and model.lightUpdate (the caller chooses the invalidation level —
+	 * typically AppendOnly). For Light invalidations with the existing cross-pane
+	 * autoscale, use setData() instead.
+	 */
+	public appendOnePlotRow(plotRow: SeriesPlotRow<T>, lastBarUpdatedOrNewBarsAddedToTheRight: boolean): void {
+		this._data.appendOne(plotRow);
+		this._conflationByFactorCache.clear();
+		this._paneView.update('data');
+		if (this._lastPriceAnimationPaneView !== null && lastBarUpdatedOrNewBarsAddedToTheRight) {
+			this._lastPriceAnimationPaneView.onNewRealtimeDataReceived();
+		}
+	}
+
 	public createPriceLine(options: PriceLineOptions): CustomPriceLine {
 		const result = new CustomPriceLine(this, options);
 		this._customPriceLines.push(result);

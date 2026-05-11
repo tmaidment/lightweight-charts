@@ -11,7 +11,7 @@ import { CrosshairMode } from '../model/crosshair';
 import { DataUpdatesConsumer, isFulfilledData, SeriesDataItemTypeMap, WhitespaceData } from '../model/data-consumer';
 import { DataLayer, DataUpdateResponse, SeriesChanges } from '../model/data-layer';
 import { CustomData, ICustomSeriesPaneView } from '../model/icustom-series';
-import { IHorzScaleBehavior } from '../model/ihorz-scale-behavior';
+import { IHorzScaleBehavior, InternalHorzScaleItem } from '../model/ihorz-scale-behavior';
 import { Pane } from '../model/pane';
 import { Series } from '../model/series';
 import { SeriesPlotRow } from '../model/series-data';
@@ -230,6 +230,26 @@ export class ChartApi<HorzScaleItem> implements IChartApiBase<HorzScaleItem>, Da
 
 	public applyNewData<TSeriesType extends SeriesType>(series: Series<TSeriesType>, data: SeriesDataItemTypeMap<HorzScaleItem>[TSeriesType][]): void {
 		this._sendUpdateToChart(this._dataLayer.setSeriesData(series, data));
+	}
+
+	public updateDataRaw(series: Series<'Line' | 'Area' | 'Histogram' | 'Baseline'>, time: number, value: number): void {
+		// Streaming-append fast path. Bypasses preprocess, time conversion, validation,
+		// DataUpdateResponse construction, and the O(N) PlotList._indices rebuild.
+		// Caller (SeriesApi.updateRaw) has already gated the series type.
+		const internalTime = time as unknown as InternalHorzScaleItem;
+		const { plotRow, affectsTimeScale, firstChangedPointIndex } =
+			this._dataLayer.updateLineSeriesRaw(series, internalTime, value);
+
+		const model = this._chartWidget.model();
+		if (affectsTimeScale) {
+			model.updateTimeScale(null, this._dataLayer.sortedTimePoints, firstChangedPointIndex);
+		}
+
+		series.appendOnePlotRow(plotRow, true);
+
+		// AppendOnly invalidation: widget skips autoscale / postponed-full checks
+		// and the cross-pane recalcAllPanes. See ChartModel.appendUpdate.
+		model.appendUpdate();
 	}
 
 	public updateData<TSeriesType extends SeriesType>(series: Series<TSeriesType>, data: SeriesDataItemTypeMap<HorzScaleItem>[TSeriesType], historicalUpdate: boolean): void {

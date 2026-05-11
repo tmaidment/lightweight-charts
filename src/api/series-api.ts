@@ -162,6 +162,19 @@ export class SeriesApi<
 		this._onDataChanged('update');
 	}
 
+	public updateRaw(time: number, value: number): void {
+		const seriesType = this._series.seriesType();
+		if (seriesType !== 'Line' && seriesType !== 'Area' && seriesType !== 'Histogram' && seriesType !== 'Baseline') {
+			throw new Error(`updateRaw is only supported for Line, Area, Histogram, and Baseline series (got ${seriesType})`);
+		}
+		this._dataUpdatesConsumer.updateDataRaw(
+			this._series as unknown as Series<'Line' | 'Area' | 'Histogram' | 'Baseline'>,
+			time,
+			value
+		);
+		this._onDataChanged('update');
+	}
+
 	public pop(count: number = 1): TData[] {
 		const poppedRows = this._dataUpdatesConsumer.popData(this._series, count);
 

@@ -113,6 +113,23 @@ export class PlotList<PlotRowType extends PlotRow = PlotRow> {
 		this._indices = plotRows.map((plotRow: PlotRowType) => plotRow.index);
 	}
 
+	/**
+	 * In-place append for the streaming hot path. Caller MUST guarantee that
+	 * `plotRow.index` is strictly greater than the current last index (monotonic).
+	 *
+	 * Why this exists: setData() does `_indices.map(...)`, an O(N) allocation
+	 * per call. With 10k bars and 30 updates/sec that's 300k array slots
+	 * allocated per second — the dominant source of GC pressure on streaming.
+	 * appendOne is O(1) and triggers no allocation beyond the new index.
+	 */
+	public appendOne(plotRow: PlotRowType): void {
+		(this._items as PlotRowType[]).push(plotRow);
+		(this._indices as TimePointIndex[]).push(plotRow.index);
+		// Monotonic append: cached searches for earlier indices remain valid.
+		// New value may extend min/max ranges across cached windows — clear.
+		this._minMaxCache.clear();
+	}
+
 	// TimePointIndex values for fulfilled data points
 	public indices(): readonly TimePointIndex[] {
 		return this._indices;

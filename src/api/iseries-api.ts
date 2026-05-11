@@ -190,6 +190,27 @@ export interface ISeriesApi<
 	update(bar: TData, historicalUpdate?: boolean): void;
 
 	/**
+	 * Streaming-append fast path for Line / Area / Histogram / Baseline series.
+	 * Bypasses object allocation, time-conversion, and time-order validation in
+	 * the data layer; also uses an O(1) in-place append on the internal PlotList
+	 * instead of the O(N) rebuild that {@link update} performs.
+	 *
+	 * Caller MUST guarantee the series type is Line, Area, Histogram, or Baseline;
+	 * `time` is a numeric UTCTimestamp (seconds since epoch) that is strictly
+	 * greater than or equal to the previous value (last-bar update at the same
+	 * time is allowed; out-of-order historical inserts are NOT); and `value` is
+	 * a finite number.
+	 *
+	 * Use this for high-frequency streaming where the server already produces
+	 * sorted data and the per-update allocations of {@link update} dominate the
+	 * GC profile. For OHLC series or out-of-order updates, use {@link update}.
+	 *
+	 * @param time - UTCTimestamp as a number (seconds since epoch).
+	 * @param value - The new data value.
+	 */
+	updateRaw(time: number, value: number): void;
+
+	/**
 	 * Removes one or more data items from the end of the series.
 	 *
 	 * @param count - The number of data items to remove.
