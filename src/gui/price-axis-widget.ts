@@ -137,7 +137,6 @@ export class PriceAxisWidget implements IDestroyable {
 
 	private readonly _cell: HTMLDivElement;
 	private readonly _canvasBinding: CanvasElementBitmapSizeBinding;
-	private readonly _topCanvasBinding: CanvasElementBitmapSizeBinding;
 
 	private _mouseEventHandler: MouseEventHandler;
 	private _mousedown: boolean = false;
@@ -194,13 +193,10 @@ export class PriceAxisWidget implements IDestroyable {
 		canvas.style.left = '0';
 		canvas.style.top = '0';
 
-		this._topCanvasBinding = createBoundCanvas(this._cell, size({ width: 16, height: 16 }));
-		this._topCanvasBinding.subscribeSuggestedBitmapSizeChanged(this._topCanvasSuggestedBitmapSizeChangedHandler);
-		const topCanvas = this._topCanvasBinding.canvasElement;
-		topCanvas.style.position = 'absolute';
-		topCanvas.style.zIndex = '2';
-		topCanvas.style.left = '0';
-		topCanvas.style.top = '0';
+		// Top canvas eliminated. Crosshair label + top-z-order sources now render
+		// on the main canvas. Cursor invalidations repaint the main axis canvas,
+		// which is cheap because the tick marks are drawImage-blitted from cache
+		// (see _drawCachedTickMarks).
 
 		const handler: MouseEventHandlers = {
 			mouseDownEvent: this._mouseDownEvent.bind(this),
@@ -216,7 +212,7 @@ export class PriceAxisWidget implements IDestroyable {
 			mouseLeaveEvent: this._mouseLeaveEvent.bind(this),
 		};
 		this._mouseEventHandler = new MouseEventHandler(
-			this._topCanvasBinding.canvasElement,
+			this._canvasBinding.canvasElement,
 			handler,
 			{
 				treatVertTouchDragAsPageScroll: () => !this._options['handleScroll'].vertTouchDrag,
@@ -227,10 +223,6 @@ export class PriceAxisWidget implements IDestroyable {
 
 	public destroy(): void {
 		this._mouseEventHandler.destroy();
-
-		this._topCanvasBinding.unsubscribeSuggestedBitmapSizeChanged(this._topCanvasSuggestedBitmapSizeChangedHandler);
-		releaseCanvas(this._topCanvasBinding.canvasElement);
-		this._topCanvasBinding.dispose();
 
 		this._canvasBinding.unsubscribeSuggestedBitmapSizeChanged(this._canvasSuggestedBitmapSizeChangedHandler);
 		releaseCanvas(this._canvasBinding.canvasElement);
@@ -341,7 +333,6 @@ export class PriceAxisWidget implements IDestroyable {
 
 			this._isSettingSize = true;
 			this._canvasBinding.resizeCanvasElement(newSize);
-			this._topCanvasBinding.resizeCanvasElement(newSize);
 			this._isSettingSize = false;
 
 			this._cell.style.width = `${newSize.width}px`;
@@ -383,31 +374,30 @@ export class PriceAxisWidget implements IDestroyable {
 		const canvasOptions: CanvasRenderingContext2DSettings = {
 			colorSpace: this._pane.chart().options().layout.colorSpace,
 		};
-		if (type !== InvalidationLevel.Cursor) {
-			this._alignLabels();
-			this._canvasBinding.applySuggestedBitmapSize();
-			const target = tryCreateCanvasRenderingTarget2D(this._canvasBinding, canvasOptions);
-			if (target !== null) {
-				target.useBitmapCoordinateSpace((scope: BitmapCoordinatesRenderingScope) => {
-					this._drawBackground(scope);
-					this._drawBorder(scope);
-				});
-				this._pane.drawAdditionalSources(target, this._sourceBottomPaneViews);
-				this._drawCachedTickMarks(target, canvasOptions);
-				this._pane.drawAdditionalSources(target, this._sourcePaneViews);
-				this._drawBackLabels(target);
-			}
+
+		this._alignLabels();
+		this._canvasBinding.applySuggestedBitmapSize();
+		const target = tryCreateCanvasRenderingTarget2D(this._canvasBinding, canvasOptions);
+		if (target === null) {
+			return;
 		}
 
-		this._topCanvasBinding.applySuggestedBitmapSize();
-		const topTarget = tryCreateCanvasRenderingTarget2D(this._topCanvasBinding, canvasOptions);
-		if (topTarget !== null) {
-			topTarget.useBitmapCoordinateSpace(({ context: ctx, bitmapSize }: BitmapCoordinatesRenderingScope) => {
-				ctx.clearRect(0, 0, bitmapSize.width, bitmapSize.height);
-			});
-			this._drawCrosshairLabel(topTarget);
-			this._pane.drawAdditionalSources(topTarget, this._sourceTopPaneViews);
-		}
+		// Static + dynamic both render here now that the top canvas is gone.
+		// The cached tick marks are drawImage-blitted (see _drawCachedTickMarks),
+		// so even Cursor-level repaints are dominated by background/border/labels —
+		// not the per-tick fillText loop they used to retrigger.
+		target.useBitmapCoordinateSpace((scope: BitmapCoordinatesRenderingScope) => {
+			this._drawBackground(scope);
+			this._drawBorder(scope);
+		});
+		this._pane.drawAdditionalSources(target, this._sourceBottomPaneViews);
+		this._drawCachedTickMarks(target, canvasOptions);
+		this._pane.drawAdditionalSources(target, this._sourcePaneViews);
+		this._drawBackLabels(target);
+
+		// Formerly on the top canvas:
+		this._drawCrosshairLabel(target);
+		this._pane.drawAdditionalSources(target, this._sourceTopPaneViews);
 	}
 
 	public getBitmapSize(): Size {
@@ -417,12 +407,11 @@ export class PriceAxisWidget implements IDestroyable {
 	public drawBitmap(ctx: CanvasRenderingContext2D, x: number, y: number, addTopLayer?: boolean): void {
 		const bitmapSize = this.getBitmapSize();
 		if (bitmapSize.width > 0 && bitmapSize.height > 0) {
+			// Top layer no longer exists; main canvas already contains crosshair
+			// labels and top-z-order sources. addTopLayer is preserved for API
+			// compatibility with PaneWidget.drawBitmap but is a no-op here.
+			void addTopLayer;
 			ctx.drawImage(this._canvasBinding.canvasElement, x, y);
-
-			if (addTopLayer) {
-				const topLayer = this._topCanvasBinding.canvasElement;
-				ctx.drawImage(topLayer, x, y);
-			}
 		}
 	}
 
@@ -831,14 +820,6 @@ export class PriceAxisWidget implements IDestroyable {
 	}
 
 	private readonly _canvasSuggestedBitmapSizeChangedHandler = () => {
-		if (this._isSettingSize) {
-			return;
-		}
-
-		this._pane.chart().model().lightUpdate();
-	};
-
-	private readonly _topCanvasSuggestedBitmapSizeChangedHandler = () => {
 		if (this._isSettingSize) {
 			return;
 		}

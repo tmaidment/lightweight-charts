@@ -59,7 +59,6 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 	private readonly _cell: HTMLElement;
 	private readonly _dv: HTMLElement;
 	private readonly _canvasBinding: CanvasElementBitmapSizeBinding;
-	private readonly _topCanvasBinding: CanvasElementBitmapSizeBinding;
 	private _leftStub: PriceAxisStub | null = null;
 	private _rightStub: PriceAxisStub | null = null;
 	private readonly _mouseEventHandler: MouseEventHandler;
@@ -120,13 +119,8 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 		canvas.style.left = '0';
 		canvas.style.top = '0';
 
-		this._topCanvasBinding = createBoundCanvas(this._dv, size({ width: 16, height: 16 }));
-		this._topCanvasBinding.subscribeSuggestedBitmapSizeChanged(this._topCanvasSuggestedBitmapSizeChangedHandler);
-		const topCanvas = this._topCanvasBinding.canvasElement;
-		topCanvas.style.position = 'absolute';
-		topCanvas.style.zIndex = '2';
-		topCanvas.style.left = '0';
-		topCanvas.style.top = '0';
+		// Top canvas eliminated — crosshair time-label + top-z-order sources now
+		// render on the main canvas. See PriceAxisWidget for the same change.
 
 		this._element.appendChild(this._leftStubCell);
 		this._element.appendChild(this._cell);
@@ -136,7 +130,7 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 		this._chart.model().priceScalesOptionsChanged().subscribe(this._recreateStubs.bind(this), this);
 
 		this._mouseEventHandler = new MouseEventHandler(
-			this._topCanvasBinding.canvasElement,
+			this._canvasBinding.canvasElement,
 			this,
 			{
 				treatVertTouchDragAsPageScroll: () => true,
@@ -153,10 +147,6 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 		if (this._rightStub !== null) {
 			this._rightStub.destroy();
 		}
-
-		this._topCanvasBinding.unsubscribeSuggestedBitmapSizeChanged(this._topCanvasSuggestedBitmapSizeChangedHandler);
-		releaseCanvas(this._topCanvasBinding.canvasElement);
-		this._topCanvasBinding.dispose();
 
 		this._canvasBinding.unsubscribeSuggestedBitmapSizeChanged(this._canvasSuggestedBitmapSizeChangedHandler);
 		releaseCanvas(this._canvasBinding.canvasElement);
@@ -270,7 +260,6 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 
 			this._isSettingSize = true;
 			this._canvasBinding.resizeCanvasElement(timeAxisSize);
-			this._topCanvasBinding.resizeCanvasElement(timeAxisSize);
 			this._isSettingSize = false;
 
 			this._cell.style.width = `${timeAxisSize.width}px`;
@@ -312,12 +301,10 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 	public drawBitmap(ctx: CanvasRenderingContext2D, x: number, y: number, addTopLayer?: boolean): void {
 		const bitmapSize = this.getBitmapSize();
 		if (bitmapSize.width > 0 && bitmapSize.height > 0) {
+			// Top layer no longer exists; main canvas already contains crosshair
+			// labels and top sources. See PriceAxisWidget.drawBitmap.
+			void addTopLayer;
 			ctx.drawImage(this._canvasBinding.canvasElement, x, y);
-
-			if (addTopLayer) {
-				const topLayer = this._topCanvasBinding.canvasElement;
-				ctx.drawImage(topLayer, x, y);
-			}
 		}
 	}
 
@@ -328,38 +315,32 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 		const canvasOptions: CanvasRenderingContext2DSettings = {
 			colorSpace: this._options.colorSpace,
 		};
-		if (type !== InvalidationLevel.Cursor) {
-			this._canvasBinding.applySuggestedBitmapSize();
-			const target = tryCreateCanvasRenderingTarget2D(this._canvasBinding, canvasOptions);
-			if (target !== null) {
-				target.useBitmapCoordinateSpace((scope: BitmapCoordinatesRenderingScope) => {
-					this._drawBackground(scope);
-					this._drawBorder(scope);
-					this._drawAdditionalSources(target, sourceBottomPaneViews);
-				});
-				this._drawCachedTickMarks(target, canvasOptions);
-				this._drawAdditionalSources(target, sourcePaneViews);
-				// atm we don't have sources to be drawn on time axis except crosshair which is rendered on top level canvas
-				// so let's don't call this code at all for now
-				// this._drawLabels(this._chart.model().dataSources(), target);
-			}
 
-			if (this._leftStub !== null) {
-				this._leftStub.paint(type);
-			}
-			if (this._rightStub !== null) {
-				this._rightStub.paint(type);
-			}
+		this._canvasBinding.applySuggestedBitmapSize();
+		const target = tryCreateCanvasRenderingTarget2D(this._canvasBinding, canvasOptions);
+		if (target !== null) {
+			// Static + dynamic both render here now that the top canvas is gone.
+			// Cached tick marks are drawImage-blitted, so Cursor-level repaints
+			// stay cheap (background/border + a handful of crosshair labels).
+			target.useBitmapCoordinateSpace((scope: BitmapCoordinatesRenderingScope) => {
+				this._drawBackground(scope);
+				this._drawBorder(scope);
+				this._drawAdditionalSources(target, sourceBottomPaneViews);
+			});
+			this._drawCachedTickMarks(target, canvasOptions);
+			this._drawAdditionalSources(target, sourcePaneViews);
+
+			// Formerly on the top canvas:
+			this._drawLabels([...this._chart.model().serieses(), this._chart.model().crosshairSource()], target);
+			this._drawAdditionalSources(target, sourceTopPaneViews);
 		}
 
-		this._topCanvasBinding.applySuggestedBitmapSize();
-		const topTarget = tryCreateCanvasRenderingTarget2D(this._topCanvasBinding, canvasOptions);
-		if (topTarget !== null) {
-			topTarget.useBitmapCoordinateSpace(({ context: ctx, bitmapSize }: BitmapCoordinatesRenderingScope) => {
-				ctx.clearRect(0, 0, bitmapSize.width, bitmapSize.height);
-			});
-			this._drawLabels([...this._chart.model().serieses(), this._chart.model().crosshairSource()], topTarget);
-			this._drawAdditionalSources(topTarget, sourceTopPaneViews);
+		// Stubs still own their own (small) canvas; not collapsed in this release.
+		if (this._leftStub !== null) {
+			this._leftStub.paint(type);
+		}
+		if (this._rightStub !== null) {
+			this._rightStub.paint(type);
 		}
 	}
 
@@ -659,12 +640,6 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 	}
 
 	private readonly _canvasSuggestedBitmapSizeChangedHandler = () => {
-		if (!this._isSettingSize) {
-			this._chart.model().lightUpdate();
-		}
-	};
-
-	private readonly _topCanvasSuggestedBitmapSizeChangedHandler = () => {
 		if (!this._isSettingSize) {
 			this._chart.model().lightUpdate();
 		}
