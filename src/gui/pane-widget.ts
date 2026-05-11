@@ -477,7 +477,10 @@ export class PaneWidget implements IDestroyable, MouseEventHandlers {
 			return;
 		}
 
-		if (type > InvalidationLevel.Cursor) {
+		// AppendOnly explicitly skips the autoscale recompute over the visible range —
+		// for streaming series.update() the source pane was already recalculated
+		// synchronously via series.setData → recalculatePane(sourcePane).
+		if (type > InvalidationLevel.AppendOnly) {
 			this.recalculatePriceScales();
 		}
 

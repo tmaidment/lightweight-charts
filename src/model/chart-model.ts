@@ -554,6 +554,23 @@ export class ChartModel<HorzScaleItem> implements IDestroyable, IChartModelBase 
 		this._invalidate(InvalidateMask.light());
 	}
 
+	/**
+	 * Hot path for streaming series.update() at the live edge. Refreshes each
+	 * pane's source views (so renderers see the new bar) without recomputing
+	 * autoscale price ranges across the visible window — that's the O(N) work
+	 * we're avoiding. Emits an AppendOnly invalidation so the widget skips the
+	 * Light measure-phase steps and goes straight to paint.
+	 *
+	 * Trade-off: if the new bar's value falls outside the current autoscale
+	 * range, the chart won't auto-zoom until the next non-append update. For
+	 * streaming financial data this is usually acceptable; callers needing
+	 * strict autoscale should fall back to lightUpdate().
+	 */
+	public appendUpdate(): void {
+		this._panes.forEach((p: Pane) => p.updateAllSources());
+		this._invalidate(InvalidateMask.appendOnly());
+	}
+
 	public cursorUpdate(): void {
 		this._invalidate(new InvalidateMask(InvalidationLevel.Cursor));
 	}

@@ -3,8 +3,17 @@ import { LogicalRange } from '../model/time-data';
 export const enum InvalidationLevel {
 	None = 0,
 	Cursor = 1,
-	Light = 2,
-	Full = 3,
+	/**
+	 * Streaming append/last-bar-update hint. Treated as lighter than Light:
+	 * the model has already updated its time scale and series data, and the
+	 * widget only needs to refresh marks + repaint. Skipped: full price-scale
+	 * autoscale recomputation across the visible range. Trade-off: if a new
+	 * bar's value extends the autoscale range, the chart won't auto-zoom until
+	 * the next non-append update (e.g. user interaction or setData).
+	 */
+	AppendOnly = 2,
+	Light = 3,
+	Full = 4,
 }
 
 export interface PaneInvalidation {
@@ -167,6 +176,10 @@ export class InvalidateMask {
 
 	public static full(): InvalidateMask {
 		return new InvalidateMask(InvalidationLevel.Full);
+	}
+
+	public static appendOnly(): InvalidateMask {
+		return new InvalidateMask(InvalidationLevel.AppendOnly);
 	}
 
 	private _applyTimeScaleInvalidation(invalidation: TimeScaleInvalidation): void {

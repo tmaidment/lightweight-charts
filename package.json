@@ -116,6 +116,7 @@
   "scripts": {
     "postinstall": "npm run install-hooks",
     "install-hooks": "node scripts/githooks/install.js",
+    "prepare": "npm run build",
     "clean": "rimraf lib/ dist/",
     "bundle-dts": "dts-bundle-generator --config dts-config.json",
     "tsc": "tspc -p tsconfig.prod.json",

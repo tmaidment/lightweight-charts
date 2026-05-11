@@ -233,7 +233,20 @@ export class ChartApi<HorzScaleItem> implements IChartApiBase<HorzScaleItem>, Da
 	}
 
 	public updateData<TSeriesType extends SeriesType>(series: Series<TSeriesType>, data: SeriesDataItemTypeMap<HorzScaleItem>[TSeriesType], historicalUpdate: boolean): void {
-		this._sendUpdateToChart(this._dataLayer.updateSeriesData(series, data, historicalUpdate));
+		const update = this._dataLayer.updateSeriesData(series, data, historicalUpdate);
+		// Streaming fast path: a single series got a single mutation at the right edge.
+		// Either no new time point (last-bar update at same time), or one new point
+		// appended past every existing point. In both cases series.setData will recalc
+		// the source pane and emit lightUpdate — skip the cross-pane work in _sendUpdateToChart.
+		const ts = update.timeScale;
+		const isLiveEdgeAppend =
+			!historicalUpdate &&
+			update.series.size === 1 &&
+			(
+				ts.firstChangedPointIndex === undefined ||
+				(ts.points !== undefined && ts.firstChangedPointIndex === ts.points.length - 1)
+			);
+		this._sendUpdateToChart(update, isLiveEdgeAppend);
 	}
 
 	public popData<TSeriesType extends SeriesType>(series: Series<TSeriesType>, count: number): SeriesPlotRow<TSeriesType>[] {
@@ -408,11 +421,19 @@ export class ChartApi<HorzScaleItem> implements IChartApiBase<HorzScaleItem>, Da
 		return res;
 	}
 
-	private _sendUpdateToChart(update: DataUpdateResponse): void {
+	private _sendUpdateToChart(update: DataUpdateResponse, isLiveEdgeAppend: boolean = false): void {
 		const model = this._chartWidget.model();
 
 		model.updateTimeScale(update.timeScale.baseIndex, update.timeScale.points, update.timeScale.firstChangedPointIndex);
 		update.series.forEach((value: SeriesChanges, series: Series<SeriesType>) => series.setData(value.data, value.info));
+
+		if (isLiveEdgeAppend) {
+			// Series.setData already ran recalculatePane on the source pane and emitted
+			// lightUpdate. Skip the cross-pane autoscale rebuild and the indices rebuild
+			// (latter is a no-op unless ignoreWhitespaceIndices is set). The cost saved
+			// is O(visibleBars × autoscaledScales) per cross-pane price scale.
+			return;
+		}
 
 		model.timeScale().recalculateIndicesWithData();
 		model.recalculateAllPanes();

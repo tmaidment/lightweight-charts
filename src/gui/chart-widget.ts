@@ -29,6 +29,7 @@ import { buildHoveredEventInfo, HoveredInfoImpl } from './hovered-event-info';
 import { suggestChartSize, suggestPriceScaleWidth, suggestTimeScaleHeight } from './internal-layout-sizes-hints';
 import { PaneSeparator, SeparatorConstants } from './pane-separator';
 import { PaneWidget } from './pane-widget';
+import { ISchedulableWidget, schedule, unschedule } from './scheduler';
 import { TimeAxisWidget } from './time-axis-widget';
 
 export interface MouseEventParamsImpl {
@@ -55,12 +56,11 @@ export interface IChartWidgetBase {
 	setCursorStyle(style: string | null): void;
 }
 
-export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBase {
+export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBase, ISchedulableWidget {
 	private readonly _options: ChartOptionsInternal<HorzScaleItem>;
 	private _paneWidgets: PaneWidget[] = [];
 	private _paneSeparators: PaneSeparator[] = [];
 	private readonly _model: ChartModel<HorzScaleItem>;
-	private _drawRafId: number = 0;
 	private _height: number = 0;
 	private _width: number = 0;
 	private _leftPriceAxisWidth: number = 0;
@@ -70,11 +70,19 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 	private _timeAxisWidget: TimeAxisWidget<HorzScaleItem>;
 	private _invalidateMask: InvalidateMask | null = null;
 	private _drawPlanned: boolean = false;
+	// Mask captured by Phase A (_measureBeforeDraw) for Phase B (_drawAfterMeasure) to paint.
+	private _pendingDrawMask: InvalidateMask | null = null;
+	private _pendingDrawTime: number = 0;
 	private _clicked: Delegate<MouseEventParamsImplSupplier> = new Delegate();
 	private _dblClicked: Delegate<MouseEventParamsImplSupplier> = new Delegate();
 	private _crosshairMoved: Delegate<MouseEventParamsImplSupplier> = new Delegate();
 	private _onWheelBound: (event: WheelEvent) => void;
 	private _observer: ResizeObserver | null = null;
+	private _visibilityObserver: IntersectionObserver | null = null;
+	// When false, the chart is fully obscured (offscreen, behind another window,
+	// in a hidden tab/iframe). Invalidations still accumulate into _invalidateMask
+	// but we skip scheduling rAF work until visibility is restored.
+	private _isVisible: boolean = true;
 
 	private _container: HTMLElement;
 	private _cursorStyleOverride: string | null = null;
@@ -136,6 +144,8 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 		this._updateTimeAxisVisibility();
 		this._model.timeScale().optionsApplied().subscribe(this._model.fullUpdate.bind(this._model), this);
 		this._model.priceScalesOptionsChanged().subscribe(this._model.fullUpdate.bind(this._model), this);
+
+		this._installVisibilityObserver();
 	}
 
 	public model(): ChartModel<HorzScaleItem> {
@@ -156,9 +166,8 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 
 	public destroy(): void {
 		this._setMouseWheelEventListener(false);
-		if (this._drawRafId !== 0) {
-			window.cancelAnimationFrame(this._drawRafId);
-		}
+		unschedule(this);
+		this._uninstallVisibilityObserver();
 
 		this._model.crosshairMoved().unsubscribeAll(this);
 		this._model.timeScale().optionsApplied().unsubscribeAll(this);
@@ -215,12 +224,10 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 		this._tableElement.style.width = widthStr;
 
 		if (forceRepaint) {
-			// Cancel any pending animation frame since we're doing a synchronous paint
-			if (this._drawRafId !== 0) {
-				window.cancelAnimationFrame(this._drawRafId);
-				this._drawRafId = 0;
-			}
+			// Drop any scheduled paint — we're going to paint synchronously below.
+			unschedule(this);
 			this._drawPlanned = false;
+			this._pendingDrawMask = null;
 
 			// Merge any pending invalidations and clear them
 			const mask = InvalidateMask.full();
@@ -344,6 +351,94 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 
 	public paneSize(paneIndex: number): Size {
 		return ensureDefined(this._paneWidgets[paneIndex]).getSize();
+	}
+
+	/**
+	 * Phase A: DOM mutations, model state updates, layout-affecting work.
+	 * Called by the shared scheduler before any widget enters Phase B, so all
+	 * DOM writes across all widgets happen back-to-back (browser does at most
+	 * one forced layout flush per frame, between Phase A and Phase B).
+	 *
+	 * Public solely because the scheduler module needs to invoke it; not part
+	 * of the chart's exported API.
+	 */
+	public measureBeforeDraw(time: number): void {
+		if (!this._drawPlanned || this._invalidateMask === null) {
+			return;
+		}
+		this._drawPlanned = false;
+
+		let invalidateMask = this._consumeInvalidateMask() as InvalidateMask;
+
+		const invalidationType = invalidateMask.fullInvalidation();
+
+		// actions for full invalidation ONLY (not shared with light)
+		if (invalidationType === InvalidationLevel.Full) {
+			this._updateGui();
+		}
+
+		// AppendOnly, Light, Full: keep time-axis marks + price-axis widget state fresh.
+		// These are needed for any change that mutates series data.
+		if (invalidationType >= InvalidationLevel.AppendOnly) {
+			this._timeAxisWidget.update();
+			this._paneWidgets.forEach((pane: PaneWidget) => {
+				pane.updatePriceAxisWidgets();
+			});
+		}
+
+		// Light or Full only: momentary autoscale + time-scale animation/range
+		// invalidations. AppendOnly explicitly skips these (the streaming hot path
+		// has already updated the source pane via series.setData → recalculatePane).
+		if (
+			invalidationType === InvalidationLevel.Full ||
+			invalidationType === InvalidationLevel.Light
+		) {
+			this._applyMomentaryAutoScale(invalidateMask);
+			this._applyTimeScaleInvalidations(invalidateMask, time);
+
+			// In the case a full invalidation has been postponed during the draw, reapply
+			// the timescale invalidations. A full invalidation would mean there is a change
+			// in the timescale width (caused by price scale changes) that needs to be drawn
+			// right away to avoid flickering.
+			if (this._invalidateMask?.fullInvalidation() === InvalidationLevel.Full) {
+				this._invalidateMask.merge(invalidateMask);
+
+				this._updateGui();
+
+				this._applyMomentaryAutoScale(this._invalidateMask);
+				this._applyTimeScaleInvalidations(this._invalidateMask, time);
+
+				invalidateMask = this._consumeInvalidateMask() as InvalidateMask;
+			}
+		}
+
+		this._pendingDrawMask = invalidateMask;
+		this._pendingDrawTime = time;
+	}
+
+	/**
+	 * Phase B: canvas painting. No DOM reads, no DOM writes. Consumes the mask
+	 * captured by Phase A.
+	 *
+	 * Public for the same reason as measureBeforeDraw.
+	 */
+	public drawAfterMeasure(): void {
+		if (this._pendingDrawMask === null) {
+			return;
+		}
+		const mask = this._pendingDrawMask;
+		const time = this._pendingDrawTime;
+		this._pendingDrawMask = null;
+
+		this.paint(mask);
+
+		// Re-queue any unfinished time scale animations for the next frame.
+		for (const tsInvalidation of mask.timeScaleInvalidations()) {
+			if (tsInvalidation.type === TimeScaleInvalidationType.Animation && !tsInvalidation.value.finished(time)) {
+				this.model().setTimeScaleAnimation(tsInvalidation.value);
+				break;
+			}
+		}
 	}
 
 	private _applyPanesOptions(): void {
@@ -621,44 +716,16 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 	}
 
 	private _drawImpl(invalidateMask: InvalidateMask, time: number): void {
-		const invalidationType = invalidateMask.fullInvalidation();
-
-		// actions for full invalidation ONLY (not shared with light)
-		if (invalidationType === InvalidationLevel.Full) {
-			this._updateGui();
+		// Synchronous variant — used by forceRepaint (resize) and takeScreenshot.
+		// Merge the caller-supplied mask into pending state, then run both phases inline.
+		if (this._invalidateMask !== null) {
+			this._invalidateMask.merge(invalidateMask);
+		} else {
+			this._invalidateMask = invalidateMask;
 		}
-
-		// light or full invalidate actions
-		if (
-			invalidationType === InvalidationLevel.Full ||
-			invalidationType === InvalidationLevel.Light
-		) {
-			this._applyMomentaryAutoScale(invalidateMask);
-			this._applyTimeScaleInvalidations(invalidateMask, time);
-
-			this._timeAxisWidget.update();
-			this._paneWidgets.forEach((pane: PaneWidget) => {
-				pane.updatePriceAxisWidgets();
-			});
-
-			// In the case a full invalidation has been postponed during the draw, reapply
-			// the timescale invalidations. A full invalidation would mean there is a change
-			// in the timescale width (caused by price scale changes) that needs to be drawn
-			// right away to avoid flickering.
-			if (this._invalidateMask?.fullInvalidation() === InvalidationLevel.Full) {
-				this._invalidateMask.merge(invalidateMask);
-
-				this._updateGui();
-
-				this._applyMomentaryAutoScale(this._invalidateMask);
-				this._applyTimeScaleInvalidations(this._invalidateMask, time);
-
-				invalidateMask = this._invalidateMask;
-				this._invalidateMask = null;
-			}
-		}
-
-		this.paint(invalidateMask);
+		this._drawPlanned = true;
+		this.measureBeforeDraw(time);
+		this.drawAfterMeasure();
 	}
 
 	private _applyTimeScaleInvalidations(invalidateMask: InvalidateMask, time: number): void {
@@ -702,32 +769,61 @@ export class ChartWidget<HorzScaleItem> implements IDestroyable, IChartWidgetBas
 		}
 	}
 
+	private _consumeInvalidateMask(): InvalidateMask | null {
+		const mask = this._invalidateMask;
+		this._invalidateMask = null;
+		return mask;
+	}
+
 	private _invalidateHandler(invalidateMask: InvalidateMask): void {
 		if (this._invalidateMask !== null) {
 			this._invalidateMask.merge(invalidateMask);
 		} else {
 			this._invalidateMask = invalidateMask;
 		}
+		this._drawPlanned = true;
 
-		if (!this._drawPlanned) {
-			this._drawPlanned = true;
-			this._drawRafId = window.requestAnimationFrame((time: number) => {
-				this._drawPlanned = false;
-				this._drawRafId = 0;
+		// While fully obscured, accumulate invalidations but don't burn rAF slots.
+		// _onVisibilityChange will trigger a fullUpdate when the widget reappears.
+		if (!this._isVisible) {
+			return;
+		}
 
-				if (this._invalidateMask !== null) {
-					const mask = this._invalidateMask;
-					this._invalidateMask = null;
-					this._drawImpl(mask, time);
+		schedule(this);
+	}
 
-					for (const tsInvalidation of mask.timeScaleInvalidations()) {
-						if (tsInvalidation.type === TimeScaleInvalidationType.Animation && !tsInvalidation.value.finished(time)) {
-							this.model().setTimeScaleAnimation(tsInvalidation.value);
-							break;
-						}
-					}
-				}
-			});
+	private _installVisibilityObserver(): void {
+		// eslint-disable-next-line no-restricted-syntax
+		if (!('IntersectionObserver' in window)) {
+			return;
+		}
+		const onIntersect = (entries: IntersectionObserverEntry[]): void => {
+			const entry = entries[entries.length - 1];
+			if (!entry) {
+				return;
+			}
+			const wasVisible = this._isVisible;
+			const nowVisible = entry.intersectionRatio > 0;
+			if (wasVisible === nowVisible) {
+				return;
+			}
+			this._isVisible = nowVisible;
+			if (!nowVisible) {
+				// Going hidden: release the rAF slot. Any accumulated _invalidateMask stays.
+				unschedule(this);
+			} else {
+				// Reappearing: force a full repaint to catch up on missed updates.
+				this._model.fullUpdate();
+			}
+		};
+		this._visibilityObserver = new IntersectionObserver(onIntersect, { threshold: [0, 0.01] });
+		this._visibilityObserver.observe(this._element);
+	}
+
+	private _uninstallVisibilityObserver(): void {
+		if (this._visibilityObserver !== null) {
+			this._visibilityObserver.disconnect();
+			this._visibilityObserver = null;
 		}
 	}
 
