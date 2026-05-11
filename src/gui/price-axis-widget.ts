@@ -148,6 +148,22 @@ export class PriceAxisWidget implements IDestroyable {
 	private _prevOptimalWidth: number = 0;
 	private _isSettingSize: boolean = false;
 
+	// Cache of the rendered tick marks (lines + labels). Tick marks rarely change
+	// between paints in the streaming hot path — when autoscale is gated out, the
+	// price scale's marks() returns the same array reference for many frames. We
+	// blit this cached bitmap instead of re-running the fillText loop.
+	private _tickMarksCacheCanvas: HTMLCanvasElement | null = null;
+	private _tickMarksCacheKey: {
+		bitmapW: number;
+		bitmapH: number;
+		marksRef: object | null;
+		font: string;
+		borderColor: string;
+		textColor: string;
+		borderVisible: boolean;
+		ticksVisible: boolean;
+	} | null = null;
+
 	private _sourcePaneViews: ViewsGetter<IDataSourcePaneViews>;
 	private _sourceTopPaneViews: ViewsGetter<IDataSourcePaneViews>;
 	private _sourceBottomPaneViews: ViewsGetter<IDataSourcePaneViews>;
@@ -219,6 +235,12 @@ export class PriceAxisWidget implements IDestroyable {
 		this._canvasBinding.unsubscribeSuggestedBitmapSizeChanged(this._canvasSuggestedBitmapSizeChangedHandler);
 		releaseCanvas(this._canvasBinding.canvasElement);
 		this._canvasBinding.dispose();
+
+		if (this._tickMarksCacheCanvas !== null) {
+			releaseCanvas(this._tickMarksCacheCanvas);
+			this._tickMarksCacheCanvas = null;
+			this._tickMarksCacheKey = null;
+		}
 
 		if (this._priceScale !== null) {
 			this._priceScale.onMarksChanged().unsubscribeAll(this);
@@ -371,7 +393,7 @@ export class PriceAxisWidget implements IDestroyable {
 					this._drawBorder(scope);
 				});
 				this._pane.drawAdditionalSources(target, this._sourceBottomPaneViews);
-				this._drawTickMarks(target);
+				this._drawCachedTickMarks(target, canvasOptions);
 				this._pane.drawAdditionalSources(target, this._sourcePaneViews);
 				this._drawBackLabels(target);
 			}
@@ -580,6 +602,83 @@ export class PriceAxisWidget implements IDestroyable {
 				const tickMark = tickMarks[i];
 				ctx.fillText(tickMark.label, textLeftX, tickMark.coord + yMidCorrections[i]);
 			}
+		});
+	}
+
+	/**
+	 * Render the tick marks (lines + labels) to an offscreen bitmap, or reuse
+	 * a cached one, then drawImage it onto `target`. The cache is keyed on the
+	 * inputs that affect what _drawTickMarks would produce: tick mark array
+	 * reference, font, colors, bitmap size, visibility flags. In the streaming
+	 * hot path (autoscale gated out for AppendOnly), the cache hits every frame
+	 * and the per-tick fillText loop is eliminated.
+	 */
+	// eslint-disable-next-line complexity
+	private _drawCachedTickMarks(target: CanvasRenderingTarget2D, canvasOptions: CanvasRenderingContext2DSettings): void {
+		if (this._size === null || this._priceScale === null) {
+			return;
+		}
+
+		const bitmap = this._canvasBinding.bitmapSize;
+		if (bitmap.width === 0 || bitmap.height === 0) {
+			return;
+		}
+
+		const priceScaleOptions = this._priceScale.options();
+		const tickMarksRef = this._priceScale.marks();
+		const font = this._baseFont();
+		const borderColor = priceScaleOptions.borderColor;
+		const textColor = priceScaleOptions.textColor ?? this._layoutOptions.textColor;
+		const borderVisible = priceScaleOptions.borderVisible;
+		const ticksVisible = priceScaleOptions.ticksVisible;
+
+		const key = this._tickMarksCacheKey;
+		const cacheValid =
+			this._tickMarksCacheCanvas !== null &&
+			key !== null &&
+			key.bitmapW === bitmap.width &&
+			key.bitmapH === bitmap.height &&
+			key.marksRef === tickMarksRef &&
+			key.font === font &&
+			key.borderColor === borderColor &&
+			key.textColor === textColor &&
+			key.borderVisible === borderVisible &&
+			key.ticksVisible === ticksVisible;
+
+		if (!cacheValid) {
+			const cacheCanvas = this._tickMarksCacheCanvas ?? document.createElement('canvas');
+			if (cacheCanvas.width !== bitmap.width || cacheCanvas.height !== bitmap.height) {
+				cacheCanvas.width = bitmap.width;
+				cacheCanvas.height = bitmap.height;
+			} else {
+				// Same dimensions — explicit clear since we're reusing the buffer.
+				const clearCtx = cacheCanvas.getContext('2d', canvasOptions);
+				if (clearCtx !== null) {
+					clearCtx.clearRect(0, 0, bitmap.width, bitmap.height);
+				}
+			}
+			const cacheCtx = cacheCanvas.getContext('2d', canvasOptions);
+			if (cacheCtx === null) {
+				return;
+			}
+			const cacheTarget = new CanvasRenderingTarget2D(cacheCtx, this._size, bitmap);
+			this._drawTickMarks(cacheTarget);
+			this._tickMarksCacheCanvas = cacheCanvas;
+			this._tickMarksCacheKey = {
+				bitmapW: bitmap.width,
+				bitmapH: bitmap.height,
+				marksRef: tickMarksRef,
+				font,
+				borderColor,
+				textColor,
+				borderVisible,
+				ticksVisible,
+			};
+		}
+
+		const cached = this._tickMarksCacheCanvas as HTMLCanvasElement;
+		target.useBitmapCoordinateSpace(({ context: ctx }: BitmapCoordinatesRenderingScope) => {
+			ctx.drawImage(cached, 0, 0);
 		});
 	}
 

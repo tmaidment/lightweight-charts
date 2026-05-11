@@ -70,6 +70,22 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 	private readonly _widthCache: TextWidthCache = new TextWidthCache(5);
 	private _isSettingSize: boolean = false;
 
+	// See PriceAxisWidget._tickMarksCacheCanvas for rationale.
+	private _tickMarksCacheCanvas: HTMLCanvasElement | null = null;
+	private _tickMarksCacheKey: {
+		bitmapW: number;
+		bitmapH: number;
+		marksRef: object | null;
+		maxWeight: number;
+		font: string;
+		boldFont: string;
+		allowBoldLabels: boolean;
+		lineColor: string;
+		textColor: string;
+		borderVisible: boolean;
+		ticksVisible: boolean;
+	} | null = null;
+
 	private readonly _horzScaleBehavior: IHorzScaleBehavior<HorzScaleItem>;
 
 	public constructor(chartWidget: ChartWidget<HorzScaleItem>, horzScaleBehavior: IHorzScaleBehavior<HorzScaleItem>) {
@@ -145,6 +161,12 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 		this._canvasBinding.unsubscribeSuggestedBitmapSizeChanged(this._canvasSuggestedBitmapSizeChangedHandler);
 		releaseCanvas(this._canvasBinding.canvasElement);
 		this._canvasBinding.dispose();
+
+		if (this._tickMarksCacheCanvas !== null) {
+			releaseCanvas(this._tickMarksCacheCanvas);
+			this._tickMarksCacheCanvas = null;
+			this._tickMarksCacheKey = null;
+		}
 	}
 
 	public getElement(): HTMLElement {
@@ -315,7 +337,7 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 					this._drawBorder(scope);
 					this._drawAdditionalSources(target, sourceBottomPaneViews);
 				});
-				this._drawTickMarks(target);
+				this._drawCachedTickMarks(target, canvasOptions);
 				this._drawAdditionalSources(target, sourcePaneViews);
 				// atm we don't have sources to be drawn on time axis except crosshair which is rendered on top level canvas
 				// so let's don't call this code at all for now
@@ -438,6 +460,86 @@ export class TimeAxisWidget<HorzScaleItem> implements MouseEventHandlers, IDestr
 					ctx.fillText(tickMark.label, coordinate, yText);
 				}
 			}
+		});
+	}
+
+	/** See PriceAxisWidget._drawCachedTickMarks for rationale. */
+	// eslint-disable-next-line complexity
+	private _drawCachedTickMarks(target: CanvasRenderingTarget2D, canvasOptions: CanvasRenderingContext2DSettings): void {
+		const timeScale = this._chart.model().timeScale();
+		const tickMarks = timeScale.marks();
+		if (!tickMarks || tickMarks.length === 0) {
+			return;
+		}
+
+		const bitmap = this._canvasBinding.bitmapSize;
+		if (bitmap.width === 0 || bitmap.height === 0) {
+			return;
+		}
+
+		const options = timeScale.options();
+		const tsOptions = this._chart.options().timeScale;
+		const maxWeight = this._horzScaleBehavior.maxTickMarkWeight(tickMarks);
+		const font = this._baseFont();
+		const boldFont = this._baseBoldFont();
+		const allowBoldLabels = tsOptions.allowBoldLabels;
+		const lineColor = this._lineColor();
+		const textColor = this._textColor();
+		const borderVisible = options.borderVisible;
+		const ticksVisible = options.ticksVisible;
+
+		const key = this._tickMarksCacheKey;
+		const cacheValid =
+			this._tickMarksCacheCanvas !== null &&
+			key !== null &&
+			key.bitmapW === bitmap.width &&
+			key.bitmapH === bitmap.height &&
+			key.marksRef === tickMarks &&
+			key.maxWeight === maxWeight &&
+			key.font === font &&
+			key.boldFont === boldFont &&
+			key.allowBoldLabels === allowBoldLabels &&
+			key.lineColor === lineColor &&
+			key.textColor === textColor &&
+			key.borderVisible === borderVisible &&
+			key.ticksVisible === ticksVisible;
+
+		if (!cacheValid) {
+			const cacheCanvas = this._tickMarksCacheCanvas ?? document.createElement('canvas');
+			if (cacheCanvas.width !== bitmap.width || cacheCanvas.height !== bitmap.height) {
+				cacheCanvas.width = bitmap.width;
+				cacheCanvas.height = bitmap.height;
+			} else {
+				const clearCtx = cacheCanvas.getContext('2d', canvasOptions);
+				if (clearCtx !== null) {
+					clearCtx.clearRect(0, 0, bitmap.width, bitmap.height);
+				}
+			}
+			const cacheCtx = cacheCanvas.getContext('2d', canvasOptions);
+			if (cacheCtx === null) {
+				return;
+			}
+			const cacheTarget = new CanvasRenderingTarget2D(cacheCtx, this._size, bitmap);
+			this._drawTickMarks(cacheTarget);
+			this._tickMarksCacheCanvas = cacheCanvas;
+			this._tickMarksCacheKey = {
+				bitmapW: bitmap.width,
+				bitmapH: bitmap.height,
+				marksRef: tickMarks,
+				maxWeight,
+				font,
+				boldFont,
+				allowBoldLabels,
+				lineColor,
+				textColor,
+				borderVisible,
+				ticksVisible,
+			};
+		}
+
+		const cached = this._tickMarksCacheCanvas as HTMLCanvasElement;
+		target.useBitmapCoordinateSpace(({ context: ctx }: BitmapCoordinatesRenderingScope) => {
+			ctx.drawImage(cached, 0, 0);
 		});
 	}
 
