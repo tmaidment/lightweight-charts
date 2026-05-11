@@ -31,8 +31,8 @@ jobs:
         # and the prepare script (we run build explicitly below).
         run: npm ci --ignore-scripts
 
-      - name: Build
-        run: npm run build
+      - name: Build (production)
+        run: npm run build:prod
 
       - name: Pack
         id: pack
@@ -48,17 +48,25 @@ jobs:
           TARBALL: ${{ steps.pack.outputs.tarball }}
           REPO: ${{ github.repository }}
         run: |
+          STANDALONE=dist/lightweight-charts.standalone.production.js
           NOTES=$(cat <<EOF
-          Prebuilt tarball for \`${TAG}\`.
+          Prebuilt artifacts for \`${TAG}\`.
 
-          Install in your project:
+          **As an npm dependency** (full package, all bundle variants):
 
           \`\`\`json
           "lightweight-charts": "https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}"
+          \`\`\`
+
+          **As a \`<script>\` tag** (standalone IIFE, production-minified):
+
+          \`\`\`html
+          <script src="https://github.com/${REPO}/releases/download/${TAG}/lightweight-charts.standalone.production.js"></script>
           \`\`\`
           EOF
           )
           gh release create "${TAG}" \
             --title "${TAG}" \
             --notes "${NOTES}" \
-            "${TARBALL}"
+            "${TARBALL}" \
+            "${STANDALONE}"
