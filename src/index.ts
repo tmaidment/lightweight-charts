@@ -21,6 +21,7 @@ export const customSeriesDefaultOptions: CustomSeriesOptions = {
 export type { ICustomSeriesPaneView, ICustomSeriesPaneRenderer, CustomBarItemData, CustomData, CustomSeriesHitTestResult } from './model/icustom-series';
 
 export { createChart, createChartEx, defaultHorzScaleBehavior } from './api/create-chart';
+export { setSchedulerMaxFps, getSchedulerMaxFps } from './gui/scheduler';
 export { createYieldCurveChart } from './api/create-yield-curve-chart';
 export { createOptionsChart } from './api/create-options-chart';
 

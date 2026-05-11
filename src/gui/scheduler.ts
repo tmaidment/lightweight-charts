@@ -26,8 +26,33 @@ export interface ISchedulableWidget {
 const pending: Set<ISchedulableWidget> = new Set();
 let rafId = 0;
 let batchDepth = 0;
+let minFrameIntervalMs = 0;
+let lastFlushTime = 0;
+
+/**
+ * Cap the shared scheduler's paint rate. Pass an FPS value (e.g. 30 or 15) to
+ * throttle, or 0 (default) for native rAF rate. Useful for many-chart pages
+ * where the visual quality at 60fps isn't worth the CPU/GPU cost.
+ *
+ * When throttled, invalidations still accumulate without delay — only the
+ * paint flush is gated. The next paint catches up with the merged mask.
+ */
+export function setSchedulerMaxFps(fps: number): void {
+	minFrameIntervalMs = fps > 0 ? 1000 / fps : 0;
+}
+
+export function getSchedulerMaxFps(): number {
+	return minFrameIntervalMs > 0 ? 1000 / minFrameIntervalMs : 0;
+}
 
 function flushFrame(time: number): void {
+	if (minFrameIntervalMs > 0 && time - lastFlushTime < minFrameIntervalMs) {
+		// Too soon — reschedule this same flush for the next rAF tick.
+		// Invalidations stay queued; we just wait one more frame.
+		rafId = window.requestAnimationFrame(flushFrame);
+		return;
+	}
+	lastFlushTime = time;
 	rafId = 0;
 	const work = Array.from(pending);
 	pending.clear();
