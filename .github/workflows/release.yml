@@ -1,0 +1,63 @@
+name: Release prebuilt tarball
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Set package version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version --no-git-tag-version --allow-same-version "$VERSION"
+
+      - name: Install dependencies
+        # --ignore-scripts skips the postinstall (githooks installer, dev-only)
+        # and the prepare script (we run build explicitly below).
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack
+        id: pack
+        run: |
+          TARBALL=$(npm pack --ignore-scripts)
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          REPO: ${{ github.repository }}
+        run: |
+          NOTES=$(cat <<EOF
+          Prebuilt tarball for \`${TAG}\`.
+
+          Install in your project:
+
+          \`\`\`json
+          "lightweight-charts": "https://github.com/${REPO}/releases/download/${TAG}/${TARBALL}"
+          \`\`\`
+          EOF
+          )
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --notes "${NOTES}" \
+            "${TARBALL}"
