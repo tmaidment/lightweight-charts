@@ -37,7 +37,8 @@ jobs:
       - name: Pack
         id: pack
         run: |
-          TARBALL=$(npm pack --ignore-scripts)
+          npm pack --ignore-scripts >/dev/null
+          TARBALL=$(ls -1 lightweight-charts-*.tgz | head -n1)
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
 
       - name: Create release
